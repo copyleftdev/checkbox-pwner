@@ -151,41 +151,53 @@ func checkBatch(bitset *BitSet, start, end int, conn *wsutil.Writer) error {
 	return nil
 }
 
-func worker(start, end int, wg *sync.WaitGroup) {
+func worker(id int, tasks chan int, wg *sync.WaitGroup) {
 	defer wg.Done()
-	logrus.Infof("👷‍♂️ Worker started for range %d to %d", start, end)
-	for {
-		bitset, err := fetchInitialState()
-		if err != nil {
-			logrus.Errorf("❌ Failed to fetch initial state: %v", err)
-			time.Sleep(reconnectWait)
-			continue
-		}
+	logrus.Infof("👷‍♂️ Worker %d started", id)
+	for start := range tasks {
+		end := start + batchSize - 1
+		for {
+			bitset, err := fetchInitialState()
+			if err != nil {
+				logrus.Errorf("❌ Worker %d: Failed to fetch initial state: %v", id, err)
+				time.Sleep(reconnectWait)
+				continue
+			}
 
-		conn, _, _, err := ws.Dial(context.Background(), socketURL)
-		if err != nil {
-			logrus.Errorf("❌ Failed to connect to WebSocket: %v", err)
-			time.Sleep(reconnectWait)
-			continue
-		}
-		writer := wsutil.NewWriter(conn, ws.StateClientSide, ws.OpText)
-		if err := checkBatch(bitset, start, end, writer); err != nil {
-			logrus.Errorf("❌ Error in checkBatch: %v", err)
+			conn, _, _, err := ws.Dial(context.Background(), socketURL)
+			if err != nil {
+				logrus.Errorf("❌ Worker %d: Failed to connect to WebSocket: %v", id, err)
+				time.Sleep(reconnectWait)
+				continue
+			}
+			writer := wsutil.NewWriter(conn, ws.StateClientSide, ws.OpText)
+			if err := checkBatch(bitset, start, end, writer); err != nil {
+				logrus.Errorf("❌ Worker %d: Error in checkBatch: %v", id, err)
+				conn.Close()
+				time.Sleep(reconnectWait)
+				continue
+			}
 			conn.Close()
-			time.Sleep(reconnectWait)
-			continue
+			break
 		}
-		conn.Close()
 	}
 }
 
 func run(cmd *cobra.Command, args []string) {
 	var wg sync.WaitGroup
+	tasks := make(chan int, numWorkers)
 
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go worker(i*(1000000/numWorkers), (i+1)*(1000000/numWorkers)-1, &wg)
+		go worker(i, tasks, &wg)
 	}
+
+	go func() {
+		for i := 0; i < 1000000; i += batchSize {
+			tasks <- i
+		}
+		close(tasks)
+	}()
 
 	logrus.Infof("🚀 Started checking checkboxes with %d workers and %s sleep duration...", numWorkers, sleepDuration)
 	wg.Wait()
